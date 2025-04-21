@@ -4,4 +4,5 @@ uvicorn[standard]
 python-dotenv
 nba_api
 pytz
+gunicorn
 # Podríamos necesitar 'requests' si hacemos llamadas directas, pero nba_api debería bastar
