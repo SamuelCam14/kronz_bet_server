@@ -1,107 +1,264 @@
 # RUTA: app/routers/predictions.py
 from fastapi import APIRouter, HTTPException, Query
-from nba_api.stats.endpoints import leaguestandingsv3
+from nba_api.stats.endpoints import leaguestandingsv3, leaguedashteamstats
 import traceback
 import time
 import math
-# *** IMPORTAR DATETIME ***
-from datetime import datetime # <--- ¡Faltaba esta línea!
+import joblib
+import os
+import numpy as np
+import pandas as pd
+from datetime import datetime
 
 router = APIRouter()
 
-# --- Pesos y Cache (sin cambios) ---
-WEIGHTS = { 'overall_wpct': 0.10, 'location_wpct': 0.15, 'last10_wpct': 0.15, 'overall_diff': 0.30, 'location_diff': 0.15, 'last10_diff': 0.15 }
-standings_cache = { "data": None, "timestamp": 0, "ttl_seconds": 60 * 15 }
+# --- Configuración ---
+SCRIPT_DIR_PRED = os.path.dirname(os.path.abspath(__file__))
+APP_ROOT_PRED = os.path.dirname(SCRIPT_DIR_PRED)
+PROJECT_ROOT_PRED = os.path.dirname(APP_ROOT_PRED)
+MODELS_DIR_PRED = os.path.join(PROJECT_ROOT_PRED, 'models', 'win_probability')
+MODEL_FILE_PRED = os.path.join(MODELS_DIR_PRED, "logistic_regression_model.joblib")
+SCALER_FILE_PRED = os.path.join(MODELS_DIR_PRED, "scaler.joblib")
 
-async def get_standings_data():
-    """ Obtiene datos de standings, usando caché simple. """
+FEATURE_COLUMNS = [
+    'H_WPCT', 'V_WPCT', 'DIFF_WPCT', 'H_LOC_WPCT', 'V_LOC_WPCT', 'DIFF_LOC_WPCT',
+    'H_L10_WPCT', 'V_L10_WPCT', 'DIFF_L10_WPCT', 'H_OFF_RTG', 'V_OFF_RTG', 'DIFF_OFF_RTG',
+    'H_DEF_RTG', 'V_DEF_RTG', 'DIFF_DEF_RTG_INV', 'H_NET_RTG', 'V_NET_RTG', 'DIFF_NET_RTG',
+    'H_PACE', 'V_PACE', 'DIFF_PACE'
+]
+
+API_SLEEP_TIME = 0.7
+
+# --- Carga Modelo y Scaler ---
+model = None
+scaler = None
+try:
+    print("[Pred Router] Loading model and scaler...")
+    if not os.path.exists(MODEL_FILE_PRED):
+        raise FileNotFoundError(f"Model file not found: {MODEL_FILE_PRED}")
+    if not os.path.exists(SCALER_FILE_PRED):
+        raise FileNotFoundError(f"Scaler file not found: {SCALER_FILE_PRED}")
+    model = joblib.load(MODEL_FILE_PRED)
+    scaler = joblib.load(SCALER_FILE_PRED)
+    print("[Pred Router] Model and scaler loaded successfully.")
+except Exception as e:
+    print(f"!!! CRITICAL ERROR: Failed to load model or scaler: {e}")
+    print("!!! Prediction endpoint WILL FAIL.")
+    traceback.print_exc()
+
+# --- Cache y Funciones de Obtención de Datos ---
+team_stats_cache = {"data": None, "timestamp": 0, "ttl_seconds": 60 * 15}
+
+# --- fetch_season_standings (CON SINTAXIS CORREGIDA) ---
+async def fetch_season_standings(season, season_type="Regular Season"):
+    print(f"Fetching Standings for {season} {season_type}...")
+    for attempt in range(3):
+        try:
+            standings = leaguestandingsv3.LeagueStandingsV3(league_id='00', season=season, season_type=season_type)
+            data = standings.get_data_frames()
+            if data and len(data) > 0:
+                print(f"OK Standings {season} {season_type} (Attempt {attempt+1})")
+                time.sleep(API_SLEEP_TIME)
+                return data[0]
+            else:
+                print(f"WARN: No standings data {season} {season_type} (Attempt {attempt+1})")
+                time.sleep(API_SLEEP_TIME)
+                # No retornar aquí, continuar al siguiente intento si es posible
+        except Exception as e:
+            print(f"!!! API Error (Standings Att {attempt+1}): {e}")
+            time.sleep(API_SLEEP_TIME * (attempt + 2))
+            # Continuar al siguiente intento
+            continue
+    # Si todos los intentos fallan
+    print(f"!!! FAILED standings {season} {season_type}");
+    return None
+
+# --- fetch_season_advanced_stats (CON SINTAXIS CORREGIDA) ---
+async def fetch_season_advanced_stats(season, season_type="Regular Season"):
+    print(f"Fetching Advanced Stats for {season} {season_type}...")
+    for attempt in range(3):
+        try:
+            stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced', season=season, season_type_all_star=season_type)
+            data = stats.get_data_frames()
+        except Exception as e:
+            print(f"!!! API Error (Advanced Att {attempt+1}): {e}")
+            time.sleep(API_SLEEP_TIME * (attempt + 2))
+            continue # Continuar al siguiente intento
+        # Separar la comprobación y el retorno
+        if data and len(data) > 0:
+            print(f"OK Advanced Stats {season} {season_type} (Attempt {attempt+1})")
+            time.sleep(API_SLEEP_TIME)
+            return data[0]
+        else:
+            print(f"WARN: No advanced stats {season} {season_type} (Attempt {attempt+1})")
+            time.sleep(API_SLEEP_TIME)
+            # No retornar aquí, continuar al siguiente intento si es posible
+    # Si todos los intentos fallan
+    print(f"!!! FAILED advanced {season} {season_type}");
+    return None
+
+# --- get_current_season_team_stats (CON SINTAXIS CORREGIDA) ---
+async def get_current_season_team_stats():
     now = time.time()
-    if standings_cache["data"] and (now - standings_cache["timestamp"] < standings_cache["ttl_seconds"]):
-        print("[Standings Cache] Using cached data.")
-        return standings_cache["data"]
-    print("[Standings Cache] Fetching new standings data...")
+    if team_stats_cache["data"] and (now - team_stats_cache["timestamp"] < team_stats_cache["ttl_seconds"]):
+        print("[Team Stats Cache] Using cached combined data.")
+        return team_stats_cache["data"]
+
+    print("[Team Stats Cache] Fetching new combined data...")
+    combined_team_stats_map = None
     try:
-        # Ahora 'datetime' está definido
         current_year = datetime.now().year
         current_month = datetime.now().month
-        season_year_str = f"{current_year-1}-{str(current_year)[-2:]}" if current_month < 9 else f"{current_year}-{str(current_year+1)[-2:]}"
-        print(f"[Standings Cache] Using season: {season_year_str}")
+        season = f"{current_year-1}-{str(current_year)[-2:]}" if current_month < 9 else f"{current_year}-{str(current_year+1)[-2:]}"
+        print(f"[Team Stats Cache] Using season: {season}")
 
-        standings = leaguestandingsv3.LeagueStandingsV3(league_id='00', season=season_year_str)
-        standings_data = standings.get_dict()
-        if not standings_data or 'resultSets' not in standings_data or not standings_data['resultSets']:
-            print("!!! Error: Could not retrieve valid standings data from NBA API."); return None
-        standings_set = standings_data['resultSets'][0]
-        headers = [h.lower() for h in standings_set['headers']]
-        rows = standings_set['rowSet']
-        standings_cache["data"] = {"headers": headers, "rows": rows}
-        standings_cache["timestamp"] = now
-        print(f"[Standings Cache] Data fetched and cached. Headers: {headers}")
-        return standings_cache["data"]
-    except Exception as e: print(f"!!! Exception fetching standings: {e}"); traceback.print_exc(); return None
+        standings_df = await fetch_season_standings(season, "Regular Season")
+        advanced_df = await fetch_season_advanced_stats(season, "Regular Season")
 
-# --- Función de Normalización (sin cambios) ---
+        if standings_df is None or advanced_df is None:
+            print("!!! Failed to fetch either standings or advanced stats. Cannot combine.")
+            return None
+
+        print("[Team Stats Cache] Combining standings and advanced stats...")
+        def find_id_column(df_columns):
+            possible_id_names = ['TEAM_ID','TeamID','teamid','team_id']
+            for name in possible_id_names:
+                 original_name = next((col for col in df_columns if col.lower() == name.lower()), None)
+                 if original_name: return original_name
+            return None
+
+        standings_id_col = find_id_column(standings_df.columns)
+        advanced_id_col = find_id_column(advanced_df.columns)
+        if standings_id_col is None or advanced_id_col is None:
+             raise ValueError("Team ID column not found for merging.")
+
+        s_df = standings_df.copy(); a_df = advanced_df.copy()
+        s_df[standings_id_col] = pd.to_numeric(s_df[standings_id_col], errors='coerce')
+        a_df[advanced_id_col] = pd.to_numeric(a_df[advanced_id_col], errors='coerce')
+        s_df.dropna(subset=[standings_id_col], inplace=True)
+        a_df.dropna(subset=[advanced_id_col], inplace=True)
+        s_df[standings_id_col] = s_df[standings_id_col].astype(int)
+        a_df[advanced_id_col] = a_df[advanced_id_col].astype(int)
+        s_df.columns = s_df.columns.str.lower()
+        a_df.columns = a_df.columns.str.lower()
+        s_df.rename(columns={standings_id_col.lower(): 'team_id'}, inplace=True)
+        a_df.rename(columns={advanced_id_col.lower(): 'team_id'}, inplace=True)
+        adv_cols_to_keep = ['team_id', 'off_rating', 'def_rating', 'pace', 'e_off_rating', 'e_def_rating', 'e_pace', 'net_rating', 'e_net_rating']
+        adv_cols_existing = [col for col in adv_cols_to_keep if col in a_df.columns]
+        advanced_df_subset = a_df[adv_cols_existing]
+        combined_df = pd.merge(s_df, advanced_df_subset, on='team_id', how='left')
+        combined_df.set_index('team_id', inplace=True)
+        combined_team_stats_map = combined_df.to_dict('index')
+        team_stats_cache["data"] = combined_team_stats_map
+        team_stats_cache["timestamp"] = now
+        print(f"[Team Stats Cache] Combined data cached for {len(combined_team_stats_map)} teams.")
+
+    except Exception as e:
+        print(f"!!! Exception combining/caching stats: {e}")
+        traceback.print_exc()
+        combined_team_stats_map = None
+
+    return combined_team_stats_map
+
+# --- Función de Normalización (CON SINTAXIS CORREGIDA) ---
 def normalize_point_diff(diff, min_diff=-15.0, max_diff=15.0):
-    if diff is None: return 0.5
-    try: diff_float = float(diff); clamped_diff = max(min_diff, min(max_diff, diff_float)); normalized = (clamped_diff - min_diff) / (max_diff - min_diff); return normalized
-    except (ValueError, TypeError): return 0.5
-
-# --- Función de Cálculo de Probabilidad (sin cambios) ---
-def calculate_win_probability(home_stats, visitor_stats):
-    if not home_stats or not visitor_stats: return None
-    print(f"[Calculator] Home Stats Input: {home_stats}")
-    print(f"[Calculator] Visitor Stats Input: {visitor_stats}")
+    if diff is None:
+        return 0.5
     try:
-        def get_win_pct(stat_value):
-            if isinstance(stat_value, (int, float)): return float(stat_value)
-            if isinstance(stat_value, str) and '-' in stat_value:
-                try: w, l = map(int, stat_value.split('-')); return w / (w + l) if (w + l) > 0 else 0.0
-                except ValueError: return 0.0
-            try: return float(stat_value)
-            except (ValueError, TypeError): print(f"WARN: Unexpected stat format: {stat_value}"); return 0.0
+        diff_float = float(diff)
+        clamped_diff = max(min_diff, min(max_diff, diff_float))
+        normalized = (clamped_diff - min_diff) / (max_diff - min_diff)
+        return normalized
+    except (ValueError, TypeError):
+        return 0.5
 
-        norm_overall_diff_h = normalize_point_diff(home_stats.get('DiffPointsPG'))
-        norm_overall_diff_v = normalize_point_diff(visitor_stats.get('DiffPointsPG'))
-        norm_loc_diff_h = normalize_point_diff(home_stats.get('HomePointDiff', home_stats.get('DiffPointsPG')))
-        norm_loc_diff_v = normalize_point_diff(visitor_stats.get('RoadPointDiff', visitor_stats.get('DiffPointsPG')))
-        norm_l10_diff_h = normalize_point_diff(home_stats.get('L10PointDiff', home_stats.get('DiffPointsPG')))
-        norm_l10_diff_v = normalize_point_diff(visitor_stats.get('L10PointDiff', visitor_stats.get('DiffPointsPG')))
+# --- Función Calcular Features (CON SINTAXIS CORREGIDA) ---
+def calculate_prediction_features(home_combined_stats, visitor_combined_stats):
+    features = {}; missing_keys_log = []
+    try:
+        def safe_get(stats_dict, key, default=0.0, type_func=float):
+            if stats_dict is None: return default
+            val = stats_dict.get(key)
+            if pd.isna(val) or val is None:
+                 if key not in missing_keys_log: missing_keys_log.append(f"{key}(None)")
+                 return default
+            try:
+                 return type_func(val)
+            except (ValueError, TypeError):
+                 if key not in missing_keys_log: missing_keys_log.append(f"{key}(ConvErr:{type(val)})")
+                 return default
 
-        rating_home = ( (get_win_pct(home_stats.get('WinPct', 0.0)) * WEIGHTS['overall_wpct']) + (get_win_pct(home_stats.get('HomeRecord', 0.0)) * WEIGHTS['location_wpct']) + (get_win_pct(home_stats.get('L10Record', 0.0)) * WEIGHTS['last10_wpct']) + (norm_overall_diff_h * WEIGHTS['overall_diff']) + (norm_loc_diff_h * WEIGHTS['location_diff']) + (norm_l10_diff_h * WEIGHTS['last10_diff']) )
-        rating_visitor = ( (get_win_pct(visitor_stats.get('WinPct', 0.0)) * WEIGHTS['overall_wpct']) + (get_win_pct(visitor_stats.get('RoadRecord', 0.0)) * WEIGHTS['location_wpct']) + (get_win_pct(visitor_stats.get('L10Record', 0.0)) * WEIGHTS['last10_wpct']) + (norm_overall_diff_v * WEIGHTS['overall_diff']) + (norm_loc_diff_v * WEIGHTS['location_diff']) + (norm_l10_diff_v * WEIGHTS['last10_diff']) )
-        print(f"[Calculator] Rating H: {rating_home:.4f}, Rating V: {rating_visitor:.4f}")
-    except Exception as e: print(f"!!! Error calculating rating: {e}"); print(f"Home: {home_stats}"); print(f"Visitor: {visitor_stats}"); return None
-    total_rating = rating_home + rating_visitor
-    if total_rating <= 0: return {"home_win_probability": 0.5, "visitor_win_probability": 0.5}
-    prob_home = rating_home / total_rating
-    return {"home_win_probability": round(prob_home, 4), "visitor_win_probability": round(1.0 - prob_home, 4)}
+        def get_pct_from_record(record_str, default=0.0):
+            if isinstance(record_str, str) and '-' in record_str:
+                try:
+                     w,l=map(int,record_str.split('-'))
+                     if (w+l) > 0:
+                          return w/(w+l)
+                     else:
+                          return default
+                except ValueError:
+                     if f"{record_str}(W-L Err)" not in missing_keys_log: missing_keys_log.append(f"{record_str}(W-L Err)")
+                     return default
+            try:
+                 return float(record_str)
+            except (ValueError, TypeError):
+                if record_str and f"{record_str}(FloatErr)" not in missing_keys_log: missing_keys_log.append(f"{record_str}(FloatErr)")
+                return default
 
+        h_wpct=safe_get(home_combined_stats,'w_pct'); v_wpct=safe_get(visitor_combined_stats,'w_pct')
+        h_loc=get_pct_from_record(home_combined_stats.get('home')); v_loc=get_pct_from_record(visitor_combined_stats.get('road'))
+        h_l10=get_pct_from_record(home_combined_stats.get('l10')); v_l10=get_pct_from_record(visitor_combined_stats.get('l10'))
+        h_off=safe_get(home_combined_stats,'off_rating'); v_off=safe_get(visitor_combined_stats,'off_rating')
+        h_def=safe_get(home_combined_stats,'def_rating'); v_def=safe_get(visitor_combined_stats,'def_rating')
+        h_pace=safe_get(home_combined_stats,'pace'); v_pace=safe_get(visitor_combined_stats,'pace')
+        h_diff=safe_get(home_combined_stats,'plus_minus', default=None); v_diff=safe_get(visitor_combined_stats,'plus_minus', default=None)
 
-# --- Endpoint (sin cambios funcionales) ---
+        features['H_WPCT']=h_wpct; features['V_WPCT']=v_wpct; features['DIFF_WPCT']=h_wpct-v_wpct
+        features['H_LOC_WPCT']=h_loc; features['V_LOC_WPCT']=v_loc; features['DIFF_LOC_WPCT']=h_loc-v_loc
+        features['H_L10_WPCT']=h_l10; features['V_L10_WPCT']=v_l10; features['DIFF_L10_WPCT']=h_l10-v_l10
+        features['H_OFF_RTG']=h_off; features['V_OFF_RTG']=v_off; features['DIFF_OFF_RTG']=h_off-v_off
+        features['H_DEF_RTG']=h_def; features['V_DEF_RTG']=v_def; features['DIFF_DEF_RTG_INV']=v_def-h_def
+        features['H_NET_RTG']=h_off-h_def; features['V_NET_RTG']=v_off-v_def; features['DIFF_NET_RTG']=(h_off-h_def)-(v_off-v_def)
+        features['H_PACE']=h_pace; features['V_PACE']=v_pace; features['DIFF_PACE']=h_pace-v_pace
+
+        if missing_keys_log: print(f"[Feature Calc] WARN: Missing/ConvErr: {missing_keys_log}")
+        ordered_features = [features.get(col_name, 0.0) for col_name in FEATURE_COLUMNS]
+        return ordered_features
+    except Exception as e: print(f"!!! Error calculating features: {e}"); print(f"H_Stats:{home_combined_stats}"); print(f"V_Stats:{visitor_combined_stats}"); traceback.print_exc(); return None
+
+# --- Endpoint de Predicción (CON SINTAXIS CORREGIDA) ---
 @router.get("/win_probability")
-async def get_win_probability_endpoint( home_team_id: int = Query(...), visitor_team_id: int = Query(...) ):
-    print(f"[API /predictions/win] Request for H:{home_team_id} vs V:{visitor_team_id}")
+async def predict_win_probability( home_team_id: int = Query(...), visitor_team_id: int = Query(...) ):
+    print(f"[API Predict] Request for H:{home_team_id} vs V:{visitor_team_id}")
+    if model is None or scaler is None:
+        raise HTTPException(status_code=503, detail="Prediction model not ready.")
     try:
-        standings_result = await get_standings_data()
-        if not standings_result: raise HTTPException(status_code=503, detail="Could not retrieve standings data.")
-        headers = standings_result["headers"]; rows = standings_result["rows"]
-        team_stats_map = {}
-        try:
-            idx_team_id = headers.index('teamid')
-            header_map_keys = { 'WinPct': 'winpct', 'HomeRecord': 'home', 'RoadRecord': 'road', 'L10Record': 'l10', 'DiffPointsPG': 'diffpointspg' }
-            header_indices = {}
-            missing_keys = []
-            for key_out, key_in in header_map_keys.items():
-                 try: header_indices[key_out] = headers.index(key_in)
-                 except ValueError: missing_keys.append(key_in)
-            if missing_keys: raise ValueError(f"Missing keys: {missing_keys}")
-        except ValueError as e: print(f"!!! Standings Header Error: {e}. Headers: {headers}"); raise HTTPException(status_code=500, detail=f"Standings structure mismatch: {e}")
-        for row in rows: t_id = row[idx_team_id]; stats = {key_out: row[idx] for key_out, idx in header_indices.items()}; team_stats_map[t_id] = stats
-        home_stats = team_stats_map.get(home_team_id); visitor_stats = team_stats_map.get(visitor_team_id)
-        if not home_stats or not visitor_stats: missing = [f"Team ID {tid}" for tid in [home_team_id, visitor_team_id] if tid not in team_stats_map]; raise HTTPException(status_code=404, detail=f"Standings data not found for: {', '.join(missing)}.")
-        probabilities = calculate_win_probability(home_stats, visitor_stats)
-        if probabilities is None: raise HTTPException(status_code=500, detail="Calculation error.")
-        print(f"[API /predictions/win] Calculated Probs: H={probabilities['home_win_probability']:.2%} V={probabilities['visitor_win_probability']:.2%}")
-        return probabilities
-    except HTTPException as http_exc: raise http_exc
-    except Exception as e: print(f"[API /predictions/win] UNEXPECTED Error: {e}"); traceback.print_exc(); raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+        combined_stats_map = await get_current_season_team_stats()
+        if not combined_stats_map:
+            raise HTTPException(status_code=503, detail="Could not retrieve current team stats.")
+        home_stats = combined_stats_map.get(home_team_id)
+        visitor_stats = combined_stats_map.get(visitor_team_id)
+        if not home_stats or not visitor_stats:
+            raise HTTPException(status_code=404, detail="Current stats not found for one or both teams.")
+
+        features = calculate_prediction_features(home_stats, visitor_stats)
+        if features is None:
+            raise HTTPException(status_code=500, detail="Feature calculation failed.")
+
+        features_array = np.array(features).reshape(1, -1)
+        features_scaled = scaler.transform(features_array)
+        print(f"[API Predict] Features calculated & scaled: {np.round(features_scaled, 3)}")
+
+        probabilities = model.predict_proba(features_scaled)[0]
+        prob_home_win = probabilities[1]
+        prob_visitor_win = probabilities[0]
+
+        print(f"[API Predict] Predicted Probs: H={prob_home_win:.4f} V={prob_visitor_win:.4f}")
+        return {"home_win_probability": round(prob_home_win, 4), "visitor_win_probability": round(prob_visitor_win, 4)}
+    except HTTPException as http_exc:
+        # Re-lanzar excepciones HTTP que ya generamos
+        raise http_exc
+    except Exception as e:
+        print(f"[API Predict] UNEXPECTED Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
