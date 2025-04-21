@@ -1,0 +1,10 @@
+# server_py/.gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+# Opcional: Si no quieres subir la DB al repo (puede ser grande)
+# data/nba_data.db
+# Opcional: Si no quieres subir los modelos entrenados
+# models/
