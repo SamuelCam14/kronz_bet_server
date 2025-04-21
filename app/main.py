@@ -14,7 +14,7 @@ from .routers import predictions # *** NUEVO IMPORT ***
 
 app = FastAPI(title="NBA Scores API (Python)")
 
-origins = [ "http://localhost:5173", "http://127.0.0.1:5173", ] # Ajusta
+origins = [ "http://localhost:5173", "http://127.0.0.1:5173", 'https://kronzbet.netlify.app/' ] # Ajusta
 
 app.add_middleware( CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"], )
 
