@@ -6,4 +6,5 @@ nba_api
 pytz
 gunicorn
 joblib
+scikit-learn
 # Podríamos necesitar 'requests' si hacemos llamadas directas, pero nba_api debería bastar
