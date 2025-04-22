@@ -5,4 +5,5 @@ python-dotenv
 nba_api
 pytz
 gunicorn
+joblib
 # Podríamos necesitar 'requests' si hacemos llamadas directas, pero nba_api debería bastar
