@@ -2,6 +2,10 @@
 
 Una aplicación web full-stack que muestra información de partidos de la NBA, incluyendo resultados diarios, box scores detallados, marcadores en vivo y predicciones de partidos utilizando un modelo de Machine Learning. Diseñada como un proyecto de portafolio para demostrar habilidades en desarrollo web moderno.
 
+# Link Frontend
+
+- GitHub: [Frontend](https://github.com/SamuelCam14/kronz_bet_client)
+
 ## Tabla de Contenidos
 
 - [Descripción](#descripción)
